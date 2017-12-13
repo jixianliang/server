@@ -189,14 +189,6 @@ inline bool trx_id_check(const void* db_trx_id, trx_id_t trx_id)
 #endif
 
 /****************************************************************//**
-Looks for the trx instance with the given id in the rw trx_list.
-@return	the trx handle or NULL if not found */
-UNIV_INLINE
-trx_t*
-trx_get_rw_trx_by_id(
-/*=================*/
-	trx_id_t	trx_id);/*!< in: trx id to search for */
-/****************************************************************//**
 Returns the minimum trx id in rw trx list. This is the smallest id for which
 the trx can possibly be active. (But, you must look at the trx->state to
 find out if the minimum trx id transaction itself is active, or already
@@ -206,30 +198,6 @@ UNIV_INLINE
 trx_id_t
 trx_rw_min_trx_id(void);
 /*===================*/
-/****************************************************************//**
-Checks if a rw transaction with the given id is active.
-@return transaction instance if active, or NULL */
-UNIV_INLINE
-trx_t*
-trx_rw_is_active_low(
-/*=================*/
-	trx_id_t	trx_id,		/*!< in: trx id of the transaction */
-	ibool*		corrupt);	/*!< in: NULL or pointer to a flag
-					that will be set if corrupt */
-/****************************************************************//**
-Checks if a rw transaction with the given id is active. If the caller is
-not holding trx_sys->mutex, the transaction may already have been
-committed.
-@return transaction instance if active, or NULL; */
-UNIV_INLINE
-trx_t*
-trx_rw_is_active(
-/*=============*/
-	trx_id_t	trx_id,		/*!< in: trx id of the transaction */
-	ibool*		corrupt,	/*!< in: NULL or pointer to a flag
-					that will be set if corrupt */
-	bool		do_ref_count);	/*!< in: if true then increment the
-					trx_t::n_ref_count */
 /*****************************************************************//**
 Updates the offset information about the end of the MySQL binlog entry
 which corresponds to the transaction just being committed. In a MySQL
@@ -479,6 +447,247 @@ FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID. */
 #define TRX_SYS_DOUBLEWRITE_BLOCK_SIZE	FSP_EXTENT_SIZE
 /* @} */
 
+trx_t* innobase_get_trx();
+
+struct rw_trx_hash_element_t
+{
+  trx_id_t id; /* lf_hash_init() relies on this to be first in the struct */
+  trx_t *trx;
+  ib_mutex_t mutex;
+};
+
+
+/** Wrapper around LF_HASH to store set of in memory read-write transactions. */
+
+class rw_trx_hash_t
+{
+  LF_HASH hash;
+
+
+  /**
+    Constructor callback for lock-free allocator.
+
+    Object is just allocated and is not yet accessible via LF_HASH by concurrent
+    threads. Object can be reused multiple times before it is freed. Every time
+    object is being reused initializer() callback is called.
+  */
+
+  static void rw_trx_hash_constructor(uchar *arg)
+  {
+    rw_trx_hash_element_t *element =
+      reinterpret_cast<rw_trx_hash_element_t*>(arg + LF_HASH_OVERHEAD);
+    element->trx = 0;
+    mutex_create(LATCH_ID_RW_TRX_HASH_ELEMENT, &element->mutex);
+  }
+
+
+  /**
+    Destructor callback for lock-free allocator.
+
+    Object is about to be freed and is not accessible via LF_HASH by concurrent
+    threads.
+  */
+
+  static void rw_trx_hash_destructor(uchar *arg)
+  {
+    rw_trx_hash_element_t *element =
+      reinterpret_cast<rw_trx_hash_element_t*>(arg + LF_HASH_OVERHEAD);
+    /*
+      XA transactions can live longer than InnoDB if they're not
+      explicitely committed or rolled back.
+    */
+    ut_ad(element->trx == 0 || element->trx->xid);
+    mutex_free(&element->mutex);
+  }
+
+
+  /**
+    Initializer callback for lock-free hash.
+
+    Object is not yet accessible via LF_HASH by concurrent threads, but is about
+    to become such. Object id can be changed only by this callback and remains
+    the same until all pins to this object are released.
+
+    Object trx can be changed to 0 by erase() under object mutex protection,
+    which indicates it is about to be removed from lock-free hash and become not
+    accessible by concurrent threads.
+  */
+
+  static void rw_trx_hash_initializer(LF_HASH *hash __attribute__((unused)),
+                                      rw_trx_hash_element_t *element,
+                                      trx_t *trx)
+  {
+    element->trx= trx;
+    element->id= trx->id;
+    trx->rw_trx_hash_element= element;
+  }
+
+
+  LF_PINS *get_pins(trx_t *trx)
+  {
+    if (!trx->rw_trx_hash_pins)
+    {
+      trx->rw_trx_hash_pins= lf_hash_get_pins(&hash);
+      ut_a(trx->rw_trx_hash_pins);
+    }
+    return trx->rw_trx_hash_pins;
+  }
+
+
+public:
+  void init()
+  {
+    lf_hash_init(&hash, sizeof(rw_trx_hash_element_t), LF_HASH_UNIQUE, 0,
+                 sizeof(trx_id_t), 0, &my_charset_bin);
+    hash.alloc.constructor= rw_trx_hash_constructor;
+    hash.alloc.destructor= rw_trx_hash_destructor;
+    hash.initializer=
+      reinterpret_cast<lf_hash_initializer>(rw_trx_hash_initializer);
+  }
+
+
+  void destroy()
+  {
+    lf_hash_destroy(&hash);
+  }
+
+
+  void put_pins(trx_t *trx)
+  {
+    if (trx->rw_trx_hash_pins)
+    {
+      lf_hash_put_pins(trx->rw_trx_hash_pins);
+      trx->rw_trx_hash_pins= 0;
+    }
+  }
+
+
+  /**
+    Finds trx object in lock-free hash with given id.
+
+    With do_ref_count == false the transaction may get committed before this
+    method returns. If the caller wants to dereference returned trx pointer it
+    must acquire lock_sys->mutex before calling find().
+
+    With do_ref_count == true caller may dereference trx even if it is not
+    holding lock_sys->mutex. Caller is responsible for calling
+    trx_release_reference() when it is done playing with trx.
+
+    Ideally this method should get caller rw_trx_hash_pins along with trx object
+    as a parameter, similar to insert() and erase(). However most callers loose
+    trx early in their call chains and it is not that easy to pass them through.
+
+    So we take more expensive approach: get trx through current_thd()->ha_data.
+    Some threads don't have trx attached to THD, and at least server
+    initialisation thread, fts_optimize_thread, srv_master_thread,
+    dict_stats_thread, srv_monitor_thread, btr_defragment_thread don't even have
+    THD at all. For such cases we allocate pins only for duration of search and
+    free them immediately.
+
+    This has negative performance impact and should be fixed eventually (by
+    passing caller_trx as a parameter). Still stream of DML is more or less Ok.
+
+    @return
+      @retval 0 not found
+      @retval pointer to trx
+  */
+
+  trx_t *find(trx_id_t trx_id, bool do_ref_count= false)
+  {
+    /*
+      In MariaDB 10.3, purge will reset DB_TRX_ID to 0
+      when the history is lost. Read/write transactions will
+      always have a nonzero trx_t::id; there the value 0 is
+      reserved for transactions that did not write or lock
+      anything yet.
+    */
+    if (!trx_id)
+      return NULL;
+
+    trx_t *trx= 0;
+    trx_t *caller_trx= innobase_get_trx();
+    LF_PINS *pins= caller_trx ? get_pins(caller_trx) : lf_hash_get_pins(&hash);
+    ut_a(pins);
+
+    rw_trx_hash_element_t *element= reinterpret_cast<rw_trx_hash_element_t*>
+      (lf_hash_search(&hash, pins, reinterpret_cast<const void*>(&trx_id),
+                      sizeof(trx_id_t)));
+    if (element)
+    {
+      mutex_enter(&element->mutex);
+      lf_hash_search_unpin(pins);
+      if ((trx= element->trx))
+      {
+        if (do_ref_count)
+          trx_reference(trx);
+#ifdef UNIV_DEBUG
+        mutex_enter(&trx->mutex);
+        ut_a(trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+             trx_state_eq(trx, TRX_STATE_PREPARED));
+        mutex_exit(&trx->mutex);
+#endif
+      }
+      mutex_exit(&element->mutex);
+    }
+    if (!caller_trx)
+      lf_hash_put_pins(pins);
+    return trx;
+  }
+
+
+  /**
+    Inserts trx to lock-free hash.
+
+    Object becomes accessible via LF_HASH.
+  */
+
+  void insert(trx_t *trx)
+  {
+    ut_ad(trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+          trx_state_eq(trx, TRX_STATE_PREPARED));
+    int res= lf_hash_insert(&hash, get_pins(trx), reinterpret_cast<void*>(trx));
+    ut_a(res == 0);
+  }
+
+
+  /**
+    Removes trx from lock-free hash.
+
+    Object becomes not accessible via LF_HASH. But it still can be pinned by
+    concurrent find(), which is supposed to release it immediately after
+    it sees object trx is 0.
+  */
+
+  void erase(trx_t *trx)
+  {
+    ut_ad(trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+          trx_state_eq(trx, TRX_STATE_PREPARED));
+    mutex_enter(&trx->rw_trx_hash_element->mutex);
+    trx->rw_trx_hash_element->trx= 0;
+    mutex_exit(&trx->rw_trx_hash_element->mutex);
+    int res= lf_hash_delete(&hash, get_pins(trx),
+                            reinterpret_cast<const void*>(&trx->id),
+                            sizeof(trx_id_t));
+    ut_a(res == 0);
+  }
+
+
+  /**
+    Returns the number of elements in the hash.
+
+    The number is exact only if hash is protected against concurrent
+    modifications (e.g. single threaded startup or hash is protected
+    by some mutex). Otherwise the number may be used as a hint only,
+    because it may change even before this method returns.
+  */
+
+  int32_t size()
+  {
+    return my_atomic_load32_explicit(&hash.count, MY_MEMORY_ORDER_RELAXED);
+  }
+};
+
+
 /** The transaction system central memory data structure. */
 struct trx_sys_t {
 
@@ -551,8 +760,11 @@ struct trx_sys_t {
 					transactions), protected by
 					rseg->mutex */
 
-	TrxIdSet	rw_trx_set;	/*!< Mapping from transaction id
-					to transaction instance */
+	/** Lock-free hash of in memory read-write transactions.
+	Works faster when it is on it's own cache line (tested). */
+	const char	pad5[CACHE_LINE_SIZE];
+	rw_trx_hash_t	rw_trx_hash;
+	const char	pad6[CACHE_LINE_SIZE];
 
 	ulint		n_prepared_trx;	/*!< Number of transactions currently
 					in the XA PREPARED state */

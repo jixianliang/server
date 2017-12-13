@@ -2825,7 +2825,7 @@ trx_t*
 innobase_get_trx()
 {
 	THD *thd=current_thd;
-	if (likely(thd != 0)) {
+	if (likely(thd != 0) && innodb_hton_ptr->slot != HA_SLOT_UNDEF) {
 		trx_t*& trx = thd_to_trx(thd);
 		return(trx);
 	} else {

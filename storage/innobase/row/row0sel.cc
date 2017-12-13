@@ -4966,7 +4966,7 @@ wrong_offs:
 				/* In delete-marked records, DB_TRX_ID must
 				always refer to an existing undo log record. */
 				ut_ad(trx_id);
-				if (!trx_rw_is_active(trx_id, NULL, false)) {
+				if (!trx_sys->rw_trx_hash.find(trx_id)) {
 					/* The clustered index record
 					was delete-marked in a committed
 					transaction. Ignore the record. */

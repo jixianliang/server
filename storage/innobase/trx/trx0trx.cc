@@ -236,6 +236,7 @@ struct TrxFactory {
 
 		new(&trx->hit_list) hit_list_t();
 
+		trx->rw_trx_hash_pins = 0;
 		trx_init(trx);
 
 		DBUG_LOG("trx", "Init: " << trx);
@@ -446,6 +447,7 @@ trx_create_low()
 
 	/* We just got trx from pool, it should be non locking */
 	ut_ad(trx->will_lock == 0);
+	ut_ad(!trx->rw_trx_hash_pins);
 
 	/* Background trx should not be forced to rollback,
 	we will unset the flag for user trx. */
@@ -483,6 +485,7 @@ trx_free(trx_t*& trx)
 {
 	assert_trx_is_free(trx);
 
+	trx_sys->rw_trx_hash.put_pins(trx);
 	trx->mysql_thd = 0;
 	trx->mysql_log_file_name = 0;
 
@@ -961,10 +964,17 @@ trx_resurrect_update(
 }
 
 static inline void trx_sys_add_trx_at_init(trx_t *trx, trx_undo_t *undo,
-                                           ib_uint64_t *rows_to_undo)
+                                           ib_uint64_t *rows_to_undo,
+                                           TrxIdSet *set)
 {
   ut_ad(trx->id != 0);
-  trx_sys->rw_trx_set.insert(TrxTrack(trx->id, trx));
+  set->insert(TrxTrack(trx->id, trx));
+  if (trx_state_eq(trx, TRX_STATE_ACTIVE) ||
+      trx_state_eq(trx, TRX_STATE_PREPARED))
+  {
+    trx_sys->rw_trx_hash.insert(trx);
+    trx_sys->rw_trx_hash.put_pins(trx);
+  }
 
   trx_resurrect_table_locks(trx, undo);
   ut_ad(trx->is_recovered);
@@ -977,6 +987,7 @@ static inline void trx_sys_add_trx_at_init(trx_t *trx, trx_undo_t *undo,
 void
 trx_lists_init_at_db_start()
 {
+	TrxIdSet set;
 	ib_uint64_t	rows_to_undo	= 0;
 	ut_a(srv_is_being_started);
 	ut_ad(!srv_was_started);
@@ -1009,7 +1020,7 @@ trx_lists_init_at_db_start()
 		     undo = UT_LIST_GET_NEXT(undo_list, undo)) {
 			trx_t*	trx = trx_resurrect_insert(undo, rseg);
 			trx->start_time = start_time;
-			trx_sys_add_trx_at_init(trx, undo, &rows_to_undo);
+			trx_sys_add_trx_at_init(trx, undo, &rows_to_undo, &set);
 		}
 
 		/* Ressurrect other transactions. */
@@ -1017,12 +1028,9 @@ trx_lists_init_at_db_start()
 		     undo != NULL;
 		     undo = UT_LIST_GET_NEXT(undo_list, undo)) {
 
-			/* Check the trx_sys->rw_trx_set first. */
-			trx_sys_mutex_enter();
-
-			trx_t*	trx = trx_get_rw_trx_by_id(undo->trx_id);
-
-			trx_sys_mutex_exit();
+			/* Check if trx_id was already registered first. */
+			TrxIdSet::iterator it = set.find(TrxTrack(undo->trx_id));
+			trx_t *trx= (it == set.end() ? 0 : it->m_trx);
 
 			if (trx == NULL) {
 				trx = trx_allocate_for_background();
@@ -1033,11 +1041,11 @@ trx_lists_init_at_db_start()
 			}
 
 			trx_resurrect_update(trx, undo, rseg);
-			trx_sys_add_trx_at_init(trx, undo, &rows_to_undo);
+			trx_sys_add_trx_at_init(trx, undo, &rows_to_undo, &set);
 		}
 	}
 
-	if (trx_sys->rw_trx_set.size()) {
+	if (set.size()) {
 		const char*	unit		= "";
 
 		if (rows_to_undo > 1000000000) {
@@ -1045,7 +1053,7 @@ trx_lists_init_at_db_start()
 			rows_to_undo = rows_to_undo / 1000000;
 		}
 
-		ib::info() << trx_sys->rw_trx_set.size()
+		ib::info() << set.size()
 			<< " transaction(s) which must be rolled back or"
 			" cleaned up in total " << rows_to_undo << unit
 			<< " row operations to undo";
@@ -1053,9 +1061,9 @@ trx_lists_init_at_db_start()
 		ib::info() << "Trx id counter is " << trx_sys->max_trx_id;
 	}
 
-	TrxIdSet::iterator	end = trx_sys->rw_trx_set.end();
+	TrxIdSet::iterator	end = set.end();
 
-	for (TrxIdSet::iterator it = trx_sys->rw_trx_set.begin();
+	for (TrxIdSet::iterator it = set.begin();
 	     it != end;
 	     ++it) {
 #ifdef UNIV_DEBUG
@@ -1191,8 +1199,8 @@ trx_t::assign_temp_rseg()
 		mutex_enter(&trx_sys->mutex);
 		id = trx_sys_get_new_trx_id();
 		trx_sys->rw_trx_ids.push_back(id);
-		trx_sys->rw_trx_set.insert(TrxTrack(id, this));
 		mutex_exit(&trx_sys->mutex);
+		trx_sys->rw_trx_hash.insert(this);
 	}
 
 	ut_ad(!rseg->is_persistent());
@@ -1282,8 +1290,6 @@ trx_start_low(
 
 		trx_sys->rw_trx_ids.push_back(trx->id);
 
-		trx_sys->rw_trx_set.insert(TrxTrack(trx->id, trx));
-
 		ut_ad(trx->rsegs.m_redo.rseg != 0
 		      || srv_read_only_mode
 		      || srv_force_recovery >= SRV_FORCE_NO_TRX_UNDO);
@@ -1300,6 +1306,7 @@ trx_start_low(
 #endif /* UNIV_DEBUG */
 
 		trx_sys_mutex_exit();
+		trx_sys->rw_trx_hash.insert(trx);
 
 	} else {
 		trx->id = 0;
@@ -1320,10 +1327,8 @@ trx_start_low(
 
 				trx_sys->rw_trx_ids.push_back(trx->id);
 
-				trx_sys->rw_trx_set.insert(
-					TrxTrack(trx->id, trx));
-
 				trx_sys_mutex_exit();
+				trx_sys->rw_trx_hash.insert(trx);
 			}
 
 			trx->state = TRX_STATE_ACTIVE;
@@ -1660,6 +1665,9 @@ trx_erase_lists(
 	bool	serialised)
 {
 	ut_ad(trx->id > 0);
+	ut_ad(!trx->read_only);
+	ut_ad(trx->rsegs.m_redo.rseg);
+
 	trx_sys_mutex_enter();
 
 	if (serialised) {
@@ -1673,23 +1681,15 @@ trx_erase_lists(
 	ut_ad(*it == trx->id);
 	trx_sys->rw_trx_ids.erase(it);
 
-	if (trx->read_only || trx->rsegs.m_redo.rseg == NULL) {
+	UT_LIST_REMOVE(trx_sys->rw_trx_list, trx);
+	ut_d(trx->in_rw_trx_list = false);
+	ut_ad(trx_sys_validate_trx_list());
 
-		ut_ad(!trx->in_rw_trx_list);
-	} else {
-
-		UT_LIST_REMOVE(trx_sys->rw_trx_list, trx);
-		ut_d(trx->in_rw_trx_list = false);
-		ut_ad(trx_sys_validate_trx_list());
-
-		if (trx->read_view != NULL) {
-			trx_sys->mvcc->view_close(trx->read_view, true);
-		}
+	if (trx->read_view != NULL) {
+		trx_sys->mvcc->view_close(trx->read_view, true);
 	}
-
-	trx_sys->rw_trx_set.erase(TrxTrack(trx->id));
-
 	trx_sys_mutex_exit();
+	trx_sys->rw_trx_hash.erase(trx);
 }
 
 /****************************************************************//**
@@ -3082,8 +3082,6 @@ trx_set_rw_mode(
 
 	trx_sys->rw_trx_ids.push_back(trx->id);
 
-	trx_sys->rw_trx_set.insert(TrxTrack(trx->id, trx));
-
 	/* So that we can see our own changes. */
 	if (MVCC::is_view_active(trx->read_view)) {
 		MVCC::set_view_creator_trx_id(trx->read_view, trx->id);
@@ -3100,6 +3098,7 @@ trx_set_rw_mode(
 	ut_d(trx->in_rw_trx_list = true);
 
 	mutex_exit(&trx_sys->mutex);
+	trx_sys->rw_trx_hash.insert(trx);
 }
 
 /**

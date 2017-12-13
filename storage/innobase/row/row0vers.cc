@@ -84,7 +84,6 @@ row_vers_impl_x_locked_low(
 	mtr_t*		mtr)
 {
 	trx_id_t	trx_id;
-	ibool		corrupt;
 	ulint		comp;
 	ulint		rec_del;
 	const rec_t*	version;
@@ -118,13 +117,15 @@ row_vers_impl_x_locked_low(
 		mem_heap_free(heap);
 		DBUG_RETURN(0);
 	}
-	corrupt = FALSE;
 
-	trx_t*	trx = trx_rw_is_active(trx_id, &corrupt, true);
+	trx_t*	trx = trx_sys->rw_trx_hash.find(trx_id, true);
 
 	if (trx == 0) {
 		/* The transaction that modified or inserted clust_rec is no
 		longer active, or it is corrupt: no implicit lock on rec */
+		trx_sys_mutex_enter();
+		bool corrupt = trx_id >= trx_sys->max_trx_id;
+		trx_sys_mutex_exit();
 		if (corrupt) {
 			lock_report_trx_id_insanity(
 				trx_id, clust_rec, clust_index, clust_offsets,
@@ -189,7 +190,7 @@ row_vers_impl_x_locked_low(
 		inserting a delete-marked record. */
 		ut_ad(prev_version
 		      || !rec_get_deleted_flag(version, comp)
-		      || !trx_rw_is_active(trx_id, NULL, false));
+		      || !trx_sys->rw_trx_hash.find(trx_id));
 
 		/* Free version and clust_offsets. */
 		mem_heap_free(old_heap);
@@ -1284,19 +1285,7 @@ row_vers_build_for_semi_consistent_read(
 			goto committed_version_trx;
 		}
 
-		trx_sys_mutex_enter();
-		version_trx = trx_get_rw_trx_by_id(version_trx_id);
-		/* Because version_trx is a read-write transaction,
-		its state cannot change from or to NOT_STARTED while
-		we are holding the trx_sys->mutex.  It may change from
-		ACTIVE to PREPARED or COMMITTED. */
-		if (version_trx
-		    && trx_state_eq(version_trx,
-				    TRX_STATE_COMMITTED_IN_MEMORY)) {
-			version_trx = NULL;
-		}
-		trx_sys_mutex_exit();
-
+		version_trx = trx_sys->rw_trx_hash.find(version_trx_id);
 		if (!version_trx) {
 committed_version_trx:
 			/* We found a version that belongs to a

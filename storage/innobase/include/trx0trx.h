@@ -55,6 +55,8 @@ class ReadView;
 // Forward declaration
 class FlushObserver;
 
+struct rw_trx_hash_element_t;
+
 /** Dummy session used currently in MySQL interface */
 extern sess_t*	trx_dummy_sess;
 
@@ -531,17 +533,12 @@ trx_set_rw_mode(
 	trx_t*		trx);
 
 /**
-Increase the reference count. If the transaction is in state
-TRX_STATE_COMMITTED_IN_MEMORY then the transaction is considered
-committed and the reference count is not incremented.
-@param trx Transaction that is being referenced
-@param do_ref_count Increment the reference iff this is true
-@return transaction instance if it is not committed */
+Increase the reference count.
+@param trx Transaction that is being referenced */
 UNIV_INLINE
-trx_t*
+void
 trx_reference(
-	trx_t*		trx,
-	bool		do_ref_count);
+	trx_t*		trx);
 
 /**
 Release the transaction. Decrease the reference count.
@@ -1278,6 +1275,8 @@ struct trx_t {
 #endif /* WITH_WSREP */
 
 	ulint		magic_n;
+	rw_trx_hash_element_t *rw_trx_hash_element;
+	LF_PINS *rw_trx_hash_pins;
 
 	/** @return whether any persistent undo log has been generated */
 	bool has_logged_persistent() const

@@ -230,17 +230,6 @@ trx_rw_is_active(
 					that will be set if corrupt */
 	bool		do_ref_count);	/*!< in: if true then increment the
 					trx_t::n_ref_count */
-#if defined UNIV_DEBUG || defined UNIV_BLOB_LIGHT_DEBUG
-/***********************************************************//**
-Assert that a transaction has been recovered.
-@return TRUE */
-UNIV_INLINE
-ibool
-trx_assert_recovered(
-/*=================*/
-	trx_id_t	trx_id)		/*!< in: transaction identifier */
-	MY_ATTRIBUTE((warn_unused_result));
-#endif /* UNIV_DEBUG || UNIV_BLOB_LIGHT_DEBUG */
 /*****************************************************************//**
 Updates the offset information about the end of the MySQL binlog entry
 which corresponds to the transaction just being committed. In a MySQL
@@ -301,13 +290,6 @@ Check if there are any active (non-prepared) transactions.
 ulint
 trx_sys_any_active_transactions(void);
 /*=================================*/
-
-/**
-Add the transaction to the RW transaction set
-@param trx		transaction instance to add */
-UNIV_INLINE
-void
-trx_sys_rw_trx_add(trx_t* trx);
 
 #ifdef UNIV_DEBUG
 /*************************************************************//**

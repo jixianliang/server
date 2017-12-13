@@ -960,10 +960,24 @@ trx_resurrect_update(
 	}
 }
 
+static inline void trx_sys_add_trx_at_init(trx_t *trx, trx_undo_t *undo,
+                                           ib_uint64_t *rows_to_undo)
+{
+  ut_ad(trx->id != 0);
+  trx_sys->rw_trx_set.insert(TrxTrack(trx->id, trx));
+
+  trx_resurrect_table_locks(trx, undo);
+  ut_ad(trx->is_recovered);
+
+  if (trx_state_eq(trx, TRX_STATE_ACTIVE))
+    *rows_to_undo += trx->undo_no;
+}
+
 /** Initialize (resurrect) transactions at startup. */
 void
 trx_lists_init_at_db_start()
 {
+	ib_uint64_t	rows_to_undo	= 0;
 	ut_a(srv_is_being_started);
 	ut_ad(!srv_was_started);
 	ut_ad(!purge_sys);
@@ -993,15 +1007,9 @@ trx_lists_init_at_db_start()
 		for (undo = UT_LIST_GET_FIRST(rseg->old_insert_list);
 		     undo != NULL;
 		     undo = UT_LIST_GET_NEXT(undo_list, undo)) {
-
-			trx_t*	trx;
-
-			trx = trx_resurrect_insert(undo, rseg);
+			trx_t*	trx = trx_resurrect_insert(undo, rseg);
 			trx->start_time = start_time;
-
-			trx_sys_rw_trx_add(trx);
-
-			trx_resurrect_table_locks(trx, undo);
+			trx_sys_add_trx_at_init(trx, undo, &rows_to_undo);
 		}
 
 		/* Ressurrect other transactions. */
@@ -1025,11 +1033,24 @@ trx_lists_init_at_db_start()
 			}
 
 			trx_resurrect_update(trx, undo, rseg);
-
-			trx_sys_rw_trx_add(trx);
-
-			trx_resurrect_table_locks(trx, undo);
+			trx_sys_add_trx_at_init(trx, undo, &rows_to_undo);
 		}
+	}
+
+	if (trx_sys->rw_trx_set.size()) {
+		const char*	unit		= "";
+
+		if (rows_to_undo > 1000000000) {
+			unit = "M";
+			rows_to_undo = rows_to_undo / 1000000;
+		}
+
+		ib::info() << trx_sys->rw_trx_set.size()
+			<< " transaction(s) which must be rolled back or"
+			" cleaned up in total " << rows_to_undo << unit
+			<< " row operations to undo";
+
+		ib::info() << "Trx id counter is " << trx_sys->max_trx_id;
 	}
 
 	TrxIdSet::iterator	end = trx_sys->rw_trx_set.end();
@@ -1037,9 +1058,8 @@ trx_lists_init_at_db_start()
 	for (TrxIdSet::iterator it = trx_sys->rw_trx_set.begin();
 	     it != end;
 	     ++it) {
-
-		ut_ad(it->m_trx->in_rw_trx_list);
 #ifdef UNIV_DEBUG
+		it->m_trx->in_rw_trx_list = true;
 		if (it->m_trx->id > trx_sys->rw_max_trx_id) {
 			trx_sys->rw_max_trx_id = it->m_trx->id;
 		}
@@ -1262,7 +1282,7 @@ trx_start_low(
 
 		trx_sys->rw_trx_ids.push_back(trx->id);
 
-		trx_sys_rw_trx_add(trx);
+		trx_sys->rw_trx_set.insert(TrxTrack(trx->id, trx));
 
 		ut_ad(trx->rsegs.m_redo.rseg != 0
 		      || srv_read_only_mode
@@ -1270,16 +1290,14 @@ trx_start_low(
 
 		UT_LIST_ADD_FIRST(trx_sys->rw_trx_list, trx);
 
-		ut_d(trx->in_rw_trx_list = true);
+		trx->state = TRX_STATE_ACTIVE;
 #ifdef UNIV_DEBUG
+		trx->in_rw_trx_list = true;
 		if (trx->id > trx_sys->rw_max_trx_id) {
 			trx_sys->rw_max_trx_id = trx->id;
 		}
+		ut_a(trx_sys_validate_trx_list());
 #endif /* UNIV_DEBUG */
-
-		trx->state = TRX_STATE_ACTIVE;
-
-		ut_ad(trx_sys_validate_trx_list());
 
 		trx_sys_mutex_exit();
 

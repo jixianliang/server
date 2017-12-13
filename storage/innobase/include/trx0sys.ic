@@ -245,29 +245,6 @@ trx_rw_min_trx_id_low(void)
 	return(id);
 }
 
-#if defined UNIV_DEBUG || defined UNIV_BLOB_LIGHT_DEBUG
-/***********************************************************//**
-Assert that a transaction has been recovered.
-@return TRUE */
-UNIV_INLINE
-ibool
-trx_assert_recovered(
-/*=================*/
-	trx_id_t	trx_id)		/*!< in: transaction identifier */
-{
-	const trx_t*	trx;
-
-	trx_sys_mutex_enter();
-
-	trx = trx_get_rw_trx_by_id(trx_id);
-	ut_a(trx->is_recovered);
-
-	trx_sys_mutex_exit();
-
-	return(TRUE);
-}
-#endif /* UNIV_DEBUG || UNIV_BLOB_LIGHT_DEBUG */
-
 /****************************************************************//**
 Returns the minimum trx id in rw trx list. This is the smallest id for which
 the rw trx can possibly be active. (But, you must look at the trx->state
@@ -442,17 +419,4 @@ trx_sys_get_n_rw_trx(void)
 	trx_sys_mutex_exit();
 
 	return(n_trx);
-}
-
-/**
-Add the transaction to the RW transaction set
-@param trx		transaction instance to add */
-UNIV_INLINE
-void
-trx_sys_rw_trx_add(trx_t* trx)
-{
-	ut_ad(trx->id != 0);
-
-	trx_sys->rw_trx_set.insert(TrxTrack(trx->id, trx));
-	ut_d(trx->in_rw_trx_list = true);
 }

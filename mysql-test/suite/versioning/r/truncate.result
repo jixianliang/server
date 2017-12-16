@@ -1,5 +1,5 @@
 create table t (a int);
-truncate t to system_time now();
+delete history from t before system_time now();
 ERROR HY000: System Versioning required: t
 create or replace table t (a int) with system versioning;
 insert into t values (1);
@@ -7,7 +7,7 @@ update t set a=2;
 set @test = 'correct';
 create trigger trg_before before delete on t for each row set @test = 'incorrect';
 create trigger trg_after after delete on t for each row set @test = 'incorrect';
-truncate t to system_time now(6);
+delete history from t before system_time now(6);
 select @test from t;
 @test
 correct
@@ -23,15 +23,18 @@ a
 22
 1
 2
-truncate t to system_time timestamp @ts1;
+delete history from t before system_time timestamp @ts1;
 select * from t for system_time all;
 a
 11
 22
+1
 2
-truncate table t to system_time timestamp now(6);
+delete history from t before system_time timestamp now(6);
 select * from t for system_time all;
 a
 11
 22
+1
+2
 drop table t;

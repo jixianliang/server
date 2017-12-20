@@ -533,26 +533,6 @@ trx_set_rw_mode(
 	trx_t*		trx);
 
 /**
-Increase the reference count.
-@param trx Transaction that is being referenced */
-UNIV_INLINE
-void
-trx_reference(
-	trx_t*		trx);
-
-/**
-Release the transaction. Decrease the reference count.
-@param trx Transaction that is being released */
-UNIV_INLINE
-void
-trx_release_reference(
-	trx_t*		trx);
-
-/**
-Check if the transaction is being referenced. */
-#define trx_is_referenced(t)	((t)->n_ref > 0)
-
-/**
 @param[in] requestor	Transaction requesting the lock
 @param[in] holder	Transaction holding the lock
 @return the transaction that will be rolled back, null don't care */
@@ -887,6 +867,38 @@ struct TrxVersion {
 };
 
 typedef std::list<TrxVersion, ut_allocator<TrxVersion> > hit_list_t;
+
+
+class trx_ref_count_t
+{
+  int32_t value;
+
+
+  int32_t get()
+  {
+    return my_atomic_load32_explicit(&value, MY_MEMORY_ORDER_RELAXED);
+  }
+
+
+public:
+  trx_ref_count_t(): value(0) {}
+  bool is_referenced() { return get() > 0; }
+
+
+  void inc()
+  {
+    ut_ad(get() >= 0);
+    my_atomic_add32_explicit(&value, 1, MY_MEMORY_ORDER_RELAXED);
+  }
+
+
+  void dec()
+  {
+    ut_ad(get() > 0);
+    my_atomic_add32_explicit(&value, -1, MY_MEMORY_ORDER_RELAXED);
+  }
+};
+
 
 struct trx_t {
 	TrxMutex	mutex;		/*!< Mutex protecting the fields
@@ -1232,13 +1244,12 @@ struct trx_t {
 	const char*	start_file;	/*!< Filename where it was started */
 #endif /* UNIV_DEBUG */
 
-	lint		n_ref;		/*!< Count of references, protected
-					by trx_t::mutex. We can't release the
-					locks nor commit the transaction until
-					this reference is 0.  We can change
-					the state to COMMITTED_IN_MEMORY to
-					signify that it is no longer
-					"active". */
+	trx_ref_count_t	ref_count;	/*!< Count of references. We can't
+					release the locks nor commit the
+					transaction until this reference is 0.
+					We can change the state to
+					COMMITTED_IN_MEMORY to signify that it
+					is no longer "active". */
 
 	/** Version of this instance. It is incremented each time the
 	instance is re-used in trx_start_low(). It is used to track

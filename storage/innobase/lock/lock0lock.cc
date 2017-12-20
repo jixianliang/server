@@ -6889,7 +6889,7 @@ lock_rec_convert_impl_to_expl_for_trx(
 	trx_t*			trx,	/*!< in/out: active transaction */
 	ulint			heap_no)/*!< in: rec heap number to lock */
 {
-	ut_ad(trx_is_referenced(trx));
+	ut_ad(trx->ref_count.is_referenced());
 	ut_ad(page_rec_is_leaf(rec));
 	ut_ad(!rec_is_default_row(rec, index));
 
@@ -6913,7 +6913,7 @@ lock_rec_convert_impl_to_expl_for_trx(
 
 	lock_mutex_exit();
 
-	trx_release_reference(trx);
+	trx->ref_count.dec();
 
 	DEBUG_SYNC_C("after_lock_rec_convert_impl_to_expl_for_trx");
 }
@@ -6957,7 +6957,7 @@ lock_rec_convert_impl_to_expl(
 	if (trx != 0) {
 		ulint	heap_no = page_rec_get_heap_no(rec);
 
-		ut_ad(trx_is_referenced(trx));
+		ut_ad(trx->ref_count.is_referenced());
 
 		/* If the transaction is still active and has no
 		explicit x-lock set on the record, set one for it.
@@ -7726,13 +7726,13 @@ lock_trx_release_locks(
 	trx->state = TRX_STATE_COMMITTED_IN_MEMORY;
 	/*--------------------------------------*/
 
-	if (trx_is_referenced(trx)) {
+	if (trx->ref_count.is_referenced()) {
 
 		ut_a(release_lock);
 
 		lock_mutex_exit();
 
-		while (trx_is_referenced(trx)) {
+		while (trx->ref_count.is_referenced()) {
 
 			trx_mutex_exit(trx);
 
@@ -7752,7 +7752,7 @@ lock_trx_release_locks(
 		trx_mutex_enter(trx);
 	}
 
-	ut_ad(!trx_is_referenced(trx));
+	ut_ad(!trx->ref_count.is_referenced());
 
 	/* If the background thread trx_rollback_or_clean_recovered()
 	is still active then there is a chance that the rollback

@@ -236,6 +236,7 @@ struct TrxFactory {
 
 		new(&trx->hit_list) hit_list_t();
 
+		new(&trx->ref_count) trx_ref_count_t();
 		trx->rw_trx_hash_pins = 0;
 		trx_init(trx);
 

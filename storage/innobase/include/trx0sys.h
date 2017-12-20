@@ -592,7 +592,7 @@ public:
       @retval pointer to trx
   */
 
-  trx_t *find(trx_id_t trx_id, bool do_ref_count= false)
+  trx_t *find(trx_t *caller_trx, trx_id_t trx_id, bool do_ref_count= false)
   {
     /*
       In MariaDB 10.3, purge will reset DB_TRX_ID to 0
@@ -605,7 +605,6 @@ public:
       return NULL;
 
     trx_t *trx= 0;
-    trx_t *caller_trx= innobase_get_trx();
     LF_PINS *pins= caller_trx ? get_pins(caller_trx) : lf_hash_get_pins(&hash);
     ut_a(pins);
 
@@ -632,6 +631,12 @@ public:
     if (!caller_trx)
       lf_hash_put_pins(pins);
     return trx;
+  }
+
+
+  trx_t *find(trx_id_t trx_id, bool do_ref_count= false)
+  {
+    return find(innobase_get_trx(), trx_id, do_ref_count);
   }
 
 
